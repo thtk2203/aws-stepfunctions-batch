@@ -1,0 +1,173 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Subnets:
+    Description: Subnets for ecs fargate tasks
+    Type: List<AWS::EC2::Subnet::Id>
+
+Resources:
+  JobTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "JobId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "JobId"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: "BatchJobs"
+
+  JobController:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: BatchJobController
+      RoleArn: !GetAtt JobRole.Arn
+      DefinitionString: !Sub 
+        - |-
+          {
+            "StartAt": "GetJob",
+            "States": {
+              "GetJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::dynamodb:getItem",
+                "Parameters": {
+                  "TableName": "${JobTableName}",
+                  "Key": {
+                    "JobId": {"S.$": "$.jobId" }
+                  }
+                },
+                "ResultPath": "$.JobDynamoDB",
+                "Next": "RunJob"
+              },
+              "RunJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::ecs:runTask.sync",
+                "Parameters": {
+                  "Cluster": "${EcsCluster}",
+                  "TaskDefinition": "${EcsTaskDef}",
+                  "LaunchType": "FARGATE",
+                  "NetworkConfiguration": { 
+                    "AwsvpcConfiguration": { 
+                      "Subnets": [
+                        "${Subnets}"
+                      ],
+                      "AssignPublicIp": "ENABLED"
+                    }
+                  },
+                  "Overrides": {
+                    "ContainerOverrides": [
+                      {
+                        "Name": "batch-main",
+                        "Environment": [
+                          {
+                            "Name": "BATCH_JOB_ID",
+                            "Value.$": "$.JobDynamoDB.Item.JobId.S"
+                          },
+                          {
+                            "Name": "BATCH_JOB_KEY",
+                            "Value.$": "$.JobDynamoDB.Item.JobKey.S"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "ResultPath": "$.JobEcs",
+                "Next": "UpdateJob"
+              },
+              "UpdateJob": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::dynamodb:updateItem",
+                "Parameters": {
+                  "TableName": "${JobTableName}",
+                  "Key": {
+                    "JobId": {"S.$": "$.jobId" }
+                  },
+                  "UpdateExpression": "SET LastStatus = :s",
+                  "ExpressionAttributeValues" : {
+                    ":s": {"S.$": "$.JobEcs.Containers[0].LastStatus"}
+                  },
+                  "ReturnValues": "ALL_NEW"
+                },
+                "ResultPath": "$.JobDynamoDB",
+                "End": true
+              }
+            }
+          }
+        - 
+          {
+            JobTableName: !Ref JobTable,
+            EcsCluster: !GetAtt EcsCluster.Arn,
+            EcsTaskDef: !Ref EcsTaskDef,
+            Subnets: !Join ["\",\"", !Ref Subnets]
+          }
+
+  JobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 
+              - states.amazonaws.com
+          Action:
+            - "sts:AssumeRole"
+      Policies:
+        - 
+          PolicyName: run-job
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - "dynamodb:GetItem"
+                - "dynamodb:UpdateItem"
+              Resource:
+                - !GetAtt JobTable.Arn
+            - Effect: Allow
+              Action:
+                - "ecs:RunTask"
+              Resource:
+                - !Sub "${EcsTaskDef}*"
+            - Effect: Allow
+              Action:
+                - "ecs:StopTask"
+                - "ecs:DescribeTasks"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "events:PutTargets"
+                - "events:PutRule"
+                - "events:DescribeRule"
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ecs-batch-job-cluster
+
+  EcsTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: "batch-job-sample"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: "awsvpc"
+      ContainerDefinitions:
+        - Name: "batch-main"
+          Essential: true
+          Image: "busybox"
+          EntryPoint: ["/bin/sleep", "30"]
+
+Outputs:
+  JobTable:
+    Description: Name of batch job table
+    Value: !Ref JobTable
+  JobController:
+    Description: Batch job controller StateMachine
+    Value: !Ref JobController
